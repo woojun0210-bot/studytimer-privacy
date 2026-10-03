@@ -9,7 +9,8 @@ import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
-ORDER = ["AL_String", "AL_Core", "AL_Plot", "AL_Find", "AL_Purge", "AL_Qty", "AL_MText", "AL_Main"]
+ORDER = ["AL_String", "AL_Match", "AL_Core", "AL_Plot", "AL_Find", "@AL_FTE.dcl", "AL_FTE",
+         "AL_Purge", "AL_Qty", "AL_MText", "AL_Main"]
 
 HEADER = """;;; ==================================================================
 ;;; AutoLisp - CAD 작업 도우미 (출력, 찾기/바꾸기, 정리, 수량, 문자 변환)
@@ -56,9 +57,25 @@ def check_parens(name, text):
         raise SystemExit(f"{name}: 여는 괄호 {depth}개가 닫히지 않았습니다")
 
 
+def dcl_to_lisp(name):
+    """DCL 파일을 (setq al:*dcl-fte* '("줄" ...)) 형태의 LISP 코드로."""
+    lines = (ROOT / "src" / name).read_text(encoding="utf-8").splitlines()
+    out = ["(setq al:*dcl-fte* '("]
+    for ln in lines:
+        if ln.strip().startswith("//") or not ln.strip():
+            continue
+        out.append('  "' + ln.replace("\\", "\\\\").replace('"', '\\"') + '"')
+    out.append("))")
+    return "\n".join(out) + "\n"
+
+
 def build():
     parts = [HEADER]
     for name in ORDER:
+        if name.startswith("@"):
+            parts.append(f"\n;;;; ---- {name[1:]} (대화상자 정의) ----\n")
+            parts.append(dcl_to_lisp(name[1:]))
+            continue
         text = (ROOT / "src" / f"{name}.lsp").read_text(encoding="utf-8")
         check_parens(name, text)
         parts.append(f"\n;;;; ---- {name}.lsp ----\n")

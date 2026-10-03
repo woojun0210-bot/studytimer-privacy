@@ -271,12 +271,176 @@
   )
 )
 
+;;;; ---- AL_Match.lsp ----
+;;; ------------------------------------------------------------------
+;;; AL_Match.lsp - 찾기 패턴 처리 (CAD 객체에 의존하지 않음)
+;;;
+;;;   와일드카드 사용 시   *   : 아무 문자 여러 개
+;;;                        #   : 숫자 한 개
+;;;                        {*} : 아무 문자 여러 개, 이 부분만 바꿀 문자로 치환
+;;;   항상                 찾을문자(?!제외1|제외2) : 바로 뒤에 제외 문자가 오면 제외
+;;; ------------------------------------------------------------------
+
+;; s 의 i 번째 위치 문자의 길이 (ANSI 모드의 한글은 2)
+(defun al:char-len (s i)
+  (if (and al:*dbcs* (> (ascii (substr s i 1)) 127)) 2 1)
+)
+
+(defun al:remove-spaces (s) (car (al:str-replace s " " "" T nil)))
+
+;; 마지막으로 나오는 위치 (0 부터), 없으면 nil
+(defun al:str-last-pos (pat str / p r)
+  (setq p 0)
+  (while (setq p (vl-string-search pat str p))
+    (setq r p p (1+ p))
+  )
+  r
+)
+
+;; 패턴 해석. 반환: (토큰목록 제외목록 전체일치)
+;;   토큰: 문자열(그대로 비교) / D(숫자 1개) / S(*) / C({*}) / E(끝)
+(defun al:pm-compile (pat wild whole cs / p excl toks lit i n c)
+  (if (and (= (substr pat (strlen pat)) ")")
+           (setq p (al:str-last-pos "(?!" pat)))
+    (setq excl (vl-remove "" (al:str-split (substr pat (+ p 4) (- (strlen pat) p 4)) "|"))
+          pat (substr pat 1 p))
+  )
+  (if (not cs)
+    (setq pat (strcase pat) excl (mapcar 'strcase excl))
+  )
+  (if wild
+    (progn
+      (setq i 1 n (strlen pat) lit "")
+      (while (<= i n)
+        (setq c (substr pat i 1))
+        (cond
+          ((= (substr pat i 3) "{*}")
+           (if (/= lit "") (setq toks (cons lit toks) lit ""))
+           (setq toks (cons 'C toks) i (+ i 3)))
+          ((member c '("*" "#"))
+           (if (/= lit "") (setq toks (cons lit toks) lit ""))
+           (setq toks (cons (if (= c "*") 'S 'D) toks) i (1+ i)))
+          (T
+           (setq c (substr pat i (al:char-len pat i))
+                 lit (strcat lit c)
+                 i (+ i (strlen c))))
+        )
+      )
+      (if (/= lit "") (setq toks (cons lit toks)))
+      (setq toks (reverse toks))
+    )
+    (if (/= pat "") (setq toks (list pat)))
+  )
+  (if (and toks whole) (setq toks (append toks (list 'E))))
+  (list toks excl whole)
+)
+
+;; 위치 i 에서 토큰이 맞으면 (끝위치 캡처목록), 아니면 nil.  캡처: ((시작 끝) ...) 역순
+(defun al:pm-match (toks s i n caps / tk r ps j)
+  (if (null toks)
+    (list i caps)
+    (progn
+      (setq tk (car toks))
+      (cond
+        ((= (type tk) 'STR)
+         (if (= (substr s i (strlen tk)) tk)
+           (al:pm-match (cdr toks) s (+ i (strlen tk)) n caps)
+         ))
+        ((eq tk 'E)
+         (if (= i (1+ n)) (al:pm-match (cdr toks) s i n caps)))
+        ((eq tk 'D)
+         (if (and (<= i n) (al:digit-p (substr s i 1)))
+           (al:pm-match (cdr toks) s (1+ i) n caps)
+         ))
+        (T
+         ;; * , {*} : 가장 길게 먼저 시도
+         (setq j i)
+         (while (<= j n)
+           (setq ps (cons j ps) j (+ j (al:char-len s j)))
+         )
+         (setq ps (cons (1+ n) ps))
+         (while (and ps (null r))
+           (setq r (al:pm-match (cdr toks) s (car ps) n
+                     (if (eq tk 'C) (cons (list i (car ps)) caps) caps))
+                 ps (cdr ps))
+         )
+         r)
+      )
+    )
+  )
+)
+
+(defun al:pm-excluded-p (excl s e)
+  (vl-some '(lambda (x) (= (substr s e (strlen x)) x)) excl)
+)
+
+;; start 위치부터 찾기. 반환 (시작 끝 캡처목록) 또는 nil. s 는 이미 대소문자 처리된 문자열
+(defun al:pm-find (cp s start / toks excl whole n i r)
+  (setq toks (car cp) excl (cadr cp) whole (caddr cp) n (strlen s) i start)
+  (if toks
+    (while (and (null r) (<= i (1+ n)) (or (not whole) (= i 1)))
+      (setq r (al:pm-match toks s i n nil))
+      (if (and r (or (= (car r) i) (al:pm-excluded-p excl s (car r))))
+        (setq r nil)
+      )
+      (if r (setq r (cons i r)))
+      (setq i (+ i (if (<= i n) (al:char-len s i) 1)))
+    )
+  )
+  r
+)
+
+(defun al:pm-test (cp s cs)
+  (if (al:pm-find cp (if cs s (strcase s)) 1) T)
+)
+
+;; 찾아 바꾸기. 반환 (새문자열 바꾼개수)
+(defun al:pm-replace (cp s repl cs / ms out pos m st en caps cur cnt k)
+  (setq ms (if cs s (strcase s)) out "" pos 1 cnt 0)
+  (while (setq m (al:pm-find cp ms pos))
+    (setq st (car m) en (cadr m) caps (reverse (caddr m)))
+    (if (vl-some '(lambda (c) (= (car c) (cadr c))) caps)
+      ;; {*} 부분이 비어 있으면 바꾸지 않는다
+      (setq k (al:char-len s st)
+            out (strcat out (substr s pos (- (+ st k) pos)))
+            pos (+ st k))
+      (progn
+        (setq out (strcat out (substr s pos (- st pos))) cur st)
+        (if caps
+          (progn
+            (foreach c caps
+              (setq out (strcat out (substr s cur (- (car c) cur)) repl) cur (cadr c))
+            )
+            (setq out (strcat out (substr s cur (- en cur))))
+          )
+          (setq out (strcat out repl))
+        )
+        (setq cnt (1+ cnt) pos en)
+      )
+    )
+  )
+  (list (strcat out (substr s pos)) cnt)
+)
+
+;; 숫자를 불필요한 0 없이 문자열로 (엑셀 값 변환용)
+(defun al:num->str (x / s)
+  (if (and (< (abs x) 2.0e9) (equal x (fix x) 1e-9))
+    (itoa (fix x))
+    (progn
+      (setq s (rtos x 2 8))
+      (while (= (substr s (strlen s)) "0") (setq s (substr s 1 (1- (strlen s)))))
+      (if (= (substr s (strlen s)) ".") (setq s (substr s 1 (1- (strlen s)))))
+      s
+    )
+  )
+)
+
 ;;;; ---- AL_Core.lsp ----
 ;;; ------------------------------------------------------------------
 ;;; AL_Core.lsp - CAD 공통 함수 (오류 처리, 설정, 선택, 출력 등)
 ;;; ------------------------------------------------------------------
 
-(setq al:*version* "1.0.0")
+(setq al:*version* "1.1.0")
 
 (if vl-load-com (vl-load-com))
 
@@ -328,12 +492,45 @@
 )
 
 (defun al:end ()
+  (if al:*relock* (al:catch 'al:layer-relock nil))
   (if al:*undo-open*
     (progn (al:catch 'al:undo-end nil) (setq al:*undo-open* nil))
   )
   (if al:*oldecho* (setvar "CMDECHO" al:*oldecho*))
   (setq *error* al:*olderr* al:*olderr* nil al:*oldecho* nil)
   (princ)
+)
+
+;;; --- 잠긴 레이어 잠시 풀기 / 다시 잠그기 -------------------------
+
+(defun al:layer-unlock (name / r ed fl)
+  (if (and name (setq r (tblobjname "LAYER" name)))
+    (progn
+      (setq ed (entget r) fl (cdr (assoc 70 ed)))
+      (if (and (= 4 (logand 4 fl))
+               (entmod (subst (cons 70 (- fl 4)) (assoc 70 ed) ed)))
+        (setq al:*relock* (cons name al:*relock*))
+      )
+    )
+  )
+)
+
+(defun al:layer-relock (/ r ed)
+  (foreach name al:*relock*
+    (if (setq r (tblobjname "LAYER" name))
+      (progn
+        (setq ed (entget r))
+        (entmod (subst (cons 70 (logior 4 (cdr (assoc 70 ed)))) (assoc 70 ed) ed))
+      )
+    )
+  )
+  (setq al:*relock* nil)
+)
+
+;; 엔티티(와 소유 블록)의 레이어 잠금을 잠시 푼다
+(defun al:unlock-for (e owner)
+  (if e (al:layer-unlock (cdr (assoc 8 (entget e)))))
+  (if (= (type owner) 'ENAME) (al:layer-unlock (cdr (assoc 8 (entget owner)))))
 )
 
 ;;; --- 설정 저장 (레지스트리/환경변수) ------------------------------
@@ -899,8 +1096,9 @@
 ;;;; ---- AL_Find.lsp ----
 ;;; ------------------------------------------------------------------
 ;;; AL_Find.lsp - 문자 찾기 / 바꾸기
-;;;   ALFIND : 문자 찾아 하나씩 확대해 보기, 찾은 객체 모두 선택
-;;;   ALFR   : 문자 찾아 바꾸기 (TEXT, MTEXT, 속성, 치수, 다중지시선, 블록 내부)
+;;;   -ALFIND : (명령행 버전) 문자 찾아 하나씩 확대해 보기, 찾은 객체 모두 선택
+;;;   -ALFR   : (명령행 버전) 문자 찾아 바꾸기
+;;;   대화상자 버전(ALFTE/ALFIND/ALFR)은 AL_FTE.lsp
 ;;; ------------------------------------------------------------------
 
 (setq al:*text-types* "TEXT,MTEXT,INSERT,DIMENSION,MULTILEADER,ATTDEF")
@@ -997,7 +1195,7 @@
   n
 )
 
-(defun c:ALFR (/ old new cs scope inblk ss total nb)
+(defun c:-ALFR (/ old new cs scope inblk ss total nb)
   (al:begin)
   (setq old (getstring T "\n찾을 문자: "))
   (if (= old "")
@@ -1043,7 +1241,7 @@
   (if (> ht 0.0) (command "_.ZOOM" "_C" (al:p3 pt) ht))
 )
 
-(defun c:ALFIND (/ str cs ss found n i k e)
+(defun c:-ALFIND (/ str cs ss found n i k e)
   (al:begin)
   (setq str (getstring T "\n찾을 문자: "))
   (if (= str "")
@@ -1082,6 +1280,1103 @@
   (if found (sssetfirst nil (al:list->ss found)))
   (princ)
 )
+
+;;;; ---- AL_FTE.dcl (대화상자 정의) ----
+(setq al:*dcl-fte* '(
+  "al_fte : dialog {"
+  "  label = \"AutoLisp - 문자 찾기/바꾸기\";"
+  "  : row {"
+  "    : column {"
+  "      : boxed_row {"
+  "        label = \"검색 위치\";"
+  "        : popup_list { key = \"scope\"; width = 22; }"
+  "        : button { key = \"selobj\"; label = \"객체 선택 <\"; fixed_width = true; }"
+  "      }"
+  "      : boxed_column {"
+  "        label = \"문자 찾기\";"
+  "        : row {"
+  "          : edit_box { key = \"ftext\"; label = \"내용\"; edit_width = 26; allow_accept = true; }"
+  "          : button { key = \"fpick\"; label = \"선택<\"; fixed_width = true; }"
+  "          : button { key = \"fpickm\"; label = \"여러 개<\"; fixed_width = true; }"
+  "        }"
+  "        : row {"
+  "          : popup_list { key = \"fhist\"; label = \"최근 내용\"; width = 36; }"
+  "          : button { key = \"fhclr\"; label = \"기록 삭제\"; fixed_width = true; }"
+  "        }"
+  "        : toggle { key = \"fwhole\"; label = \"전체 내용 일치 문자만 찾기\"; }"
+  "        : toggle { key = \"fmulti\"; label = \"찾는 내용 쉼표(,) 구분해 여러 문자 찾기\"; }"
+  "        : toggle { key = \"fcase\"; label = \"대소문자 구분\"; }"
+  "        : button { key = \"dofind\"; label = \"찾기\"; is_default = true; }"
+  "      }"
+  "    }"
+  "    : boxed_column {"
+  "      label = \"문자 바꾸기\";"
+  "      : row {"
+  "        : edit_box { key = \"rfind\"; label = \"찾을 문자\"; edit_width = 22; }"
+  "        : button { key = \"rpick\"; label = \"선택<\"; fixed_width = true; }"
+  "      }"
+  "      : edit_box { key = \"rrepl\"; label = \"바꿀 문자\"; edit_width = 22; }"
+  "      : row {"
+  "        : button { key = \"radd\"; label = \"목록에 추가\"; }"
+  "        : button { key = \"rdel\"; label = \"선택 삭제\"; }"
+  "        : button { key = \"rclr\"; label = \"전체 삭제\"; }"
+  "      }"
+  "      : list_box { key = \"rlist\"; height = 6; width = 50; multiple_select = true; tabs = \"24\"; }"
+  "      : row {"
+  "        : button { key = \"rtxt\"; label = \"텍스트 파일...\"; }"
+  "        : edit_box { key = \"rdelim\"; label = \"구분 문자\"; edit_width = 3; }"
+  "        : button { key = \"rxls\"; label = \"엑셀 선택 영역...\"; }"
+  "      }"
+  "      : row {"
+  "        : popup_list { key = \"rsaved\"; label = \"저장 목록\"; width = 30; }"
+  "        : button { key = \"rload\"; label = \"불러오기\"; fixed_width = true; }"
+  "        : button { key = \"rsdel\"; label = \"삭제\"; fixed_width = true; }"
+  "      }"
+  "      : row {"
+  "        : edit_box { key = \"rsname\"; label = \"저장 이름\"; edit_width = 16; }"
+  "        : button { key = \"rsave\"; label = \"현재 목록 저장\"; fixed_width = true; }"
+  "      }"
+  "      : toggle { key = \"rwhole\"; label = \"전체 내용 일치 문자만 바꾸기\"; }"
+  "      : toggle { key = \"rcase\"; label = \"대소문자 구분\"; }"
+  "      : button { key = \"doreplace\"; label = \"바꾸기 실행\"; }"
+  "    }"
+  "  }"
+  "  : boxed_column {"
+  "    label = \"결과 (더블 클릭하면 확대)\";"
+  "    : list_box { key = \"results\"; height = 12; width = 110; multiple_select = true; tabs = \"6 16 36\"; }"
+  "    : text { key = \"status\"; width = 100; }"
+  "    : row {"
+  "      : button { key = \"rzoom\"; label = \"확대\"; }"
+  "      : button { key = \"rsel\"; label = \"선택 항목 도면에서 선택\"; }"
+  "      : button { key = \"rselall\"; label = \"찾은 문자 모두 선택\"; }"
+  "      : button { key = \"rline\"; label = \"연결선 그리기\"; }"
+  "      : button { key = \"rerase\"; label = \"선택 항목 삭제\"; }"
+  "      : button { key = \"rremove\"; label = \"목록에서 제거\"; }"
+  "    }"
+  "  }"
+  "  : row {"
+  "    : button { key = \"settings\"; label = \"검색 설정 / 찾은 문자 처리...\"; fixed_width = true; }"
+  "    : text { key = \"procinfo\"; width = 46; }"
+  "    : button { key = \"cancel\"; label = \"닫기\"; is_cancel = true; fixed_width = true; }"
+  "  }"
+  "}"
+  "al_fte_set : dialog {"
+  "  label = \"검색 설정\";"
+  "  : row {"
+  "    : boxed_column {"
+  "      label = \"검색 대상 객체\";"
+  "      : toggle { key = \"t_text\"; label = \"단일행 문자 (TEXT)\"; }"
+  "      : toggle { key = \"t_mtext\"; label = \"여러 줄 문자 (MTEXT)\"; }"
+  "      : toggle { key = \"t_attr\"; label = \"블록 속성, 속성 정의\"; }"
+  "      : toggle { key = \"t_block\"; label = \"블록 내부 문자\"; }"
+  "      : toggle { key = \"t_dim\"; label = \"치수 (재지정 문자만)\"; }"
+  "      : toggle { key = \"t_mlead\"; label = \"다중 지시선\"; }"
+  "      : toggle { key = \"t_table\"; label = \"표 (테이블)\"; }"
+  "    }"
+  "    : boxed_column {"
+  "      label = \"옵션\";"
+  "      : toggle { key = \"oneblock\"; label = \"동일 블록은 결과에 항목 하나로 표기\"; }"
+  "      : toggle { key = \"fspace\"; label = \"찾기 띄어쓰기 무시\"; }"
+  "      : toggle { key = \"rspace\"; label = \"바꾸기 띄어쓰기 무시 (바꾼 문자는 띄어쓰기 삭제됨)\"; }"
+  "      : toggle { key = \"foff\"; label = \"찾기 꺼진/동결 레이어 제외\"; }"
+  "      : toggle { key = \"roff\"; label = \"바꾸기 꺼진/동결 레이어 제외\"; }"
+  "      : toggle { key = \"wild\"; label = \"와일드카드 사용  ( *  #  {*} )\"; }"
+  "      : edit_box { key = \"zoom\"; label = \"찾은 문자 Zoom 단계 (작을수록 크게)\"; edit_width = 6; }"
+  "      : toggle { key = \"rect\"; label = \"Zoom 할 때 문자 영역에 가상 사각형 표시\"; }"
+  "    }"
+  "  }"
+  "  : boxed_column {"
+  "    label = \"찾은 문자 처리 (찾기/바꾸기 공통)\";"
+  "    : radio_row {"
+  "      key = \"proc\";"
+  "      : radio_button { key = \"p0\"; label = \"처리 없음\"; }"
+  "      : radio_button { key = \"p1\"; label = \"찾은 문자 삭제\"; }"
+  "      : radio_button { key = \"p2\"; label = \"찾은 문자 특성 변경\"; }"
+  "    }"
+  "    : row {"
+  "      : toggle { key = \"ph\"; label = \"높이\"; }"
+  "      : edit_box { key = \"phv\"; edit_width = 8; }"
+  "      : toggle { key = \"pw\"; label = \"폭 비율\"; }"
+  "      : edit_box { key = \"pwv\"; edit_width = 8; }"
+  "      : toggle { key = \"pc\"; label = \"색상 (0~256)\"; }"
+  "      : edit_box { key = \"pcv\"; edit_width = 5; }"
+  "    }"
+  "    : row {"
+  "      : toggle { key = \"ps\"; label = \"문자 스타일\"; }"
+  "      : popup_list { key = \"psv\"; width = 22; }"
+  "      : toggle { key = \"pl\"; label = \"레이어\"; }"
+  "      : popup_list { key = \"plv\"; width = 26; }"
+  "    }"
+  "  }"
+  "  ok_cancel;"
+  "}"
+))
+
+;;;; ---- AL_FTE.lsp ----
+;;; ------------------------------------------------------------------
+;;; AL_FTE.lsp - 문자 찾기/바꾸기 (대화상자)
+;;;   ALFTE / ALFIND / ALFR
+;;;
+;;;   결과 레코드: (종류 엔티티 부가정보 문자)
+;;;     종류     : TEXT MTEXT ATTRIB ATTDEF DIM MLEADER TABLE BLOCK
+;;;     부가정보 : ATTRIB/BLOCK 은 소유 블록(INSERT), TABLE 은 (행 열)
+;;;     문자     : 서식 없는 내용, 여러 줄은 "\n" 으로 연결
+;;; ------------------------------------------------------------------
+
+(setq al:*fte-defaults*
+  '(("scope" . "1") ("fwhole" . "0") ("fmulti" . "0") ("fcase" . "0")
+    ("rwhole" . "0") ("rcase" . "0") ("rdelim" . ",")
+    ("t_text" . "1") ("t_mtext" . "1") ("t_attr" . "1") ("t_block" . "1")
+    ("t_dim" . "1") ("t_mlead" . "1") ("t_table" . "1")
+    ("oneblock" . "0") ("fspace" . "0") ("rspace" . "0") ("foff" . "0") ("roff" . "0")
+    ("wild" . "0") ("zoom" . "15") ("rect" . "1")
+    ("proc" . "p0") ("ph" . "0") ("phv" . "2.5") ("pw" . "0") ("pwv" . "1.0")
+    ("pc" . "0") ("pcv" . "1") ("ps" . "0") ("psv" . "") ("pl" . "0") ("plv" . "")))
+
+(setq al:*fte-main-toggles* '("fwhole" "fmulti" "fcase" "rwhole" "rcase"))
+(setq al:*fte-set-toggles*
+  '("t_text" "t_mtext" "t_attr" "t_block" "t_dim" "t_mlead" "t_table"
+    "oneblock" "fspace" "rspace" "foff" "roff" "wild" "rect" "ph" "pw" "pc" "ps" "pl"))
+
+(setq al:*fte-scopes* '("전체 도면 (모형+배치)" "현재 공간" "모형" "배치" "객체 선택"))
+
+(setq al:*fte-kind-names*
+  '(("TEXT" . "문자") ("MTEXT" . "여러줄") ("ATTRIB" . "속성") ("ATTDEF" . "속성정의")
+    ("DIM" . "치수") ("MLEADER" . "지시선") ("TABLE" . "표") ("BLOCK" . "블록내부")))
+
+(defun al:fo (k) (al:cfg-get (strcat "FTE_" k) (cdr (assoc k al:*fte-defaults*))))
+(defun al:fo-set (k v) (al:cfg-set (strcat "FTE_" k) v))
+(defun al:fob (k) (= (al:fo k) "1"))
+
+(defun al:mt-lines (s) (al:str-join (al:mt-paragraphs s) "\n"))
+(defun al:lines->mt (s) (al:str-join (mapcar 'al:mt-escape (al:str-split s "\n")) "\\P"))
+
+;;; --- 저장 폴더 (찾기/바꾸기 목록) -----------------------------------
+
+(defun al:data-dir (/ d)
+  (setq d (al:catch 'getenv (list "APPDATA")))
+  (if (or (null d) (= d "")) (setq d (getvar "TEMPPREFIX")))
+  (setq d (strcat (vl-string-right-trim "\\/" d) "\\AutoLisp"))
+  (vl-mkdir d)
+  (setq d (strcat d "\\FTE"))
+  (vl-mkdir d)
+  (strcat d "\\")
+)
+
+;;; --- 검색 대상 수집 -------------------------------------------------
+
+(defun al:fte-types (/ l)
+  (if (al:fob "t_text") (setq l (cons "TEXT" l)))
+  (if (al:fob "t_mtext") (setq l (cons "MTEXT" l)))
+  (if (or (al:fob "t_attr") (al:fob "t_block")) (setq l (cons "INSERT" l)))
+  (if (al:fob "t_attr") (setq l (cons "ATTDEF" l)))
+  (if (al:fob "t_dim") (setq l (cons "DIMENSION" l)))
+  (if (al:fob "t_mlead") (setq l (cons "MULTILEADER" l)))
+  (if (al:fob "t_table") (setq l (cons "ACAD_TABLE" l)))
+  (al:str-join l ",")
+)
+
+(defun al:fte-ents (/ types scope flt ss)
+  (setq types (al:fte-types) scope (al:fo "scope"))
+  (if (/= types "")
+    (progn
+      (setq flt (list (cons 0 types)))
+      (setq ss (cond
+                 ((= scope "0") (ssget "X" flt))
+                 ((= scope "1") (ssget "X" (append flt (list (cons 410 (getvar "CTAB"))))))
+                 ((= scope "2") (ssget "X" (append flt '((410 . "Model")))))
+                 ((= scope "3") (ssget "X" (append flt '((-4 . "<NOT") (410 . "Model") (-4 . "NOT>")))))
+                 (T al:*fte-ss*)))
+      (vl-remove-if-not
+        '(lambda (e) (and (entget e) (wcmatch (cdr (assoc 0 (entget e))) types)))
+        (al:ss->list ss))
+    )
+  )
+)
+
+(defun al:off-layers (/ r l)
+  (setq r (tblnext "LAYER" T))
+  (while r
+    (if (or (< (cdr (assoc 62 r)) 0) (= 1 (logand 1 (cdr (assoc 70 r)))))
+      (setq l (cons (strcase (cdr (assoc 2 r))) l))
+    )
+    (setq r (tblnext "LAYER"))
+  )
+  l
+)
+
+(defun al:fte-off-p (e offl)
+  (and offl (member (strcase (cdr (assoc 8 (entget e)))) offl))
+)
+
+;; ActiveX 로 문자 읽기/쓰기 (다중 지시선, 표)
+(defun al:fte-ax-get (e cell / o)
+  (if (al:activex-p)
+    (progn
+      (setq o (vlax-ename->vla-object e))
+      (if cell
+        (al:catch 'vla-GetText (list o (car cell) (cadr cell)))
+        (al:catch 'vla-get-TextString (list o))
+      )
+    )
+  )
+)
+
+(defun al:fte-ax-set (e cell s / o)
+  (if (al:activex-p)
+    (progn
+      (setq o (vlax-ename->vla-object e))
+      (not (vl-catch-all-error-p
+             (if cell
+               (vl-catch-all-apply 'vla-SetText (list o (car cell) (cadr cell) s))
+               (vl-catch-all-apply 'vla-put-TextString (list o s)))))
+    )
+  )
+)
+
+(defun al:fte-table-cells (e / o nr nc r c s out)
+  (if (al:activex-p)
+    (progn
+      (setq o (vlax-ename->vla-object e)
+            nr (al:catch 'vla-get-Rows (list o))
+            nc (al:catch 'vla-get-Columns (list o))
+            r 0)
+      (if (and nr nc)
+        (repeat nr
+          (setq c 0)
+          (repeat nc
+            (setq s (al:catch 'vla-GetText (list o r c)))
+            (if (and s (/= s ""))
+              (setq out (cons (list "TABLE" e (list r c) (al:mt-lines s)) out))
+            )
+            (setq c (1+ c))
+          )
+          (setq r (1+ r))
+        )
+      )
+    )
+  )
+  (reverse out)
+)
+
+;; 블록 정의 안의 문자: ((엔티티 문자) ...)  중첩 블록 4단계까지
+(defun al:fte-block-texts (name depth / c b e ed typ out)
+  (if (setq c (assoc name al:*fte-blkcache*))
+    (cdr c)
+    (progn
+      (setq b (tblsearch "BLOCK" name))
+      (if (and b (= 0 (logand 4 (cdr (assoc 70 b)))))
+        (progn
+          (setq e (cdr (assoc -2 b)))
+          (while e
+            (setq ed (entget e) typ (cdr (assoc 0 ed)))
+            (if (not (al:fte-off-p e al:*fte-offl*))
+              (cond
+                ((= typ "TEXT") (setq out (cons (list e (cdr (assoc 1 ed))) out)))
+                ((= typ "MTEXT") (setq out (cons (list e (al:mt-lines (al:mtext-string ed))) out)))
+                ((and (= typ "DIMENSION") (/= (cdr (assoc 1 ed)) ""))
+                 (setq out (cons (list e (cdr (assoc 1 ed))) out)))
+                ((and (= typ "INSERT") (< depth 4))
+                 (setq out (append (reverse (al:fte-block-texts (cdr (assoc 2 ed)) (1+ depth))) out)))
+              )
+            )
+            (setq e (entnext e))
+          )
+        )
+      )
+      (setq out (reverse out)
+            al:*fte-blkcache* (cons (cons name out) al:*fte-blkcache*))
+      out
+    )
+  )
+)
+
+;; 검색 대상 레코드 목록
+(defun al:fte-cands (offl / out ed typ s a)
+  (setq al:*fte-blkcache* nil al:*fte-offl* offl)
+  (foreach e (al:fte-ents)
+    (setq ed (entget e) typ (cdr (assoc 0 ed)))
+    (if (not (al:fte-off-p e offl))
+      (cond
+        ((= typ "TEXT") (setq out (cons (list "TEXT" e nil (cdr (assoc 1 ed))) out)))
+        ((= typ "ATTDEF") (setq out (cons (list "ATTDEF" e nil (cdr (assoc 1 ed))) out)))
+        ((= typ "MTEXT") (setq out (cons (list "MTEXT" e nil (al:mt-lines (al:mtext-string ed))) out)))
+        ((= typ "DIMENSION")
+         (if (/= (cdr (assoc 1 ed)) "") (setq out (cons (list "DIM" e nil (cdr (assoc 1 ed))) out))))
+        ((= typ "MULTILEADER")
+         (if (setq s (al:fte-ax-get e nil)) (setq out (cons (list "MLEADER" e nil (al:mt-lines s)) out))))
+        ((= typ "ACAD_TABLE")
+         (setq out (append (reverse (al:fte-table-cells e)) out)))
+        ((= typ "INSERT")
+         (if (and (al:fob "t_attr") (= (cdr (assoc 66 ed)) 1))
+           (progn
+             (setq a (entnext e))
+             (while (and a (= (cdr (assoc 0 (entget a))) "ATTRIB"))
+               (if (not (al:fte-off-p a offl))
+                 (setq out (cons (list "ATTRIB" a e (cdr (assoc 1 (entget a)))) out))
+               )
+               (setq a (entnext a))
+             )
+           )
+         )
+         (if (al:fob "t_block")
+           (foreach x (al:fte-block-texts (cdr (assoc 2 ed)) 0)
+             (setq out (cons (list "BLOCK" (car x) e (cadr x)) out))
+           )
+         ))
+      )
+    )
+  )
+  (reverse out)
+)
+
+;;; --- 찾기 -----------------------------------------------------------
+
+(defun al:fte-prep (s sp cs)
+  (if sp (setq s (al:remove-spaces s)))
+  (if cs s (strcase s))
+)
+
+(defun al:fte-do-find (text / cs sp terms cps res seen ms)
+  (setq cs (al:fob "fcase") sp (al:fob "fspace"))
+  (setq terms (if (al:fob "fmulti")
+                (vl-remove "" (mapcar 'al:str-trim (al:str-split text ",")))
+                (list text)))
+  (setq cps (mapcar '(lambda (x) (al:pm-compile (if sp (al:remove-spaces x) x) (al:fob "wild") (al:fob "fwhole") cs))
+                    terms))
+  (foreach c (al:fte-cands (if (al:fob "foff") (al:off-layers)))
+    (setq ms (al:fte-prep (nth 3 c) sp cs))
+    (if (and (vl-some '(lambda (cp) (al:pm-find cp ms 1)) cps)
+             (not (and (al:fob "oneblock") (= (car c) "BLOCK") (member (cadr c) seen))))
+      (progn
+        (if (= (car c) "BLOCK") (setq seen (cons (cadr c) seen)))
+        (setq res (cons c res))
+      )
+    )
+  )
+  (reverse res)
+)
+
+;;; --- 바꾸기 ---------------------------------------------------------
+
+;; cps: ((패턴 바꿀문자 대소문자 원래찾을문자) ...)
+(defun al:fte-apply-pairs (s cps sp / total r base)
+  (setq total 0)
+  (foreach p cps
+    (setq base (if sp (al:remove-spaces s) s)
+          r (al:pm-replace (car p) base (cadr p) (caddr p)))
+    (if (> (cadr r) 0) (setq s (car r) total (+ total (cadr r))))
+  )
+  (list s total)
+)
+
+;; 서식을 유지한 채 바꾸기 (와일드카드/전체일치/띄어쓰기무시/제외 없을 때)
+(defun al:fte-raw-replace (raw cps / total r)
+  (setq total 0)
+  (foreach p cps
+    (setq r (al:str-replace raw (cadddr p) (cadr p) (caddr p) T))
+    (if (> (cadr r) 0) (setq raw (car r) total (+ total (cadr r))))
+  )
+  (list raw total)
+)
+
+(defun al:fte-entmod-1 (e s / ed)
+  (setq ed (entget e))
+  (entmod (subst (cons 1 s) (assoc 1 ed) ed))
+)
+
+;; 한 레코드 바꾸기. 반환 (바꾼개수 새문자) 또는 nil
+(defun al:fte-replace-cand (c cps simple sp / kind e typ raw r ok)
+  (setq kind (car c) e (cadr c)
+        typ (if (= kind "BLOCK") (cdr (assoc 0 (entget e))) kind))
+  (if (member typ '("MTEXT" "MLEADER" "TABLE"))
+    (progn
+      (setq raw (cond ((= typ "MTEXT") (al:mtext-string (entget e)))
+                      ((= typ "MLEADER") (al:fte-ax-get e nil))
+                      (T (al:fte-ax-get e (caddr c)))))
+      (if raw
+        (if simple
+          (setq r (al:fte-raw-replace raw cps))
+          (progn
+            (setq r (al:fte-apply-pairs (al:mt-lines raw) cps sp))
+            (if (> (cadr r) 0) (setq r (list (al:lines->mt (car r)) (cadr r))))
+          )
+        )
+      )
+    )
+    (setq r (al:fte-apply-pairs (nth 3 c) cps sp))
+  )
+  (if (and r (> (cadr r) 0))
+    (progn
+      (al:unlock-for e (caddr c))
+      (setq ok (cond
+                 ((= typ "MTEXT") (entmod (al:mtext-set (entget e) (car r))))
+                 ((= typ "MLEADER") (al:fte-ax-set e nil (car r)))
+                 ((= typ "TABLE") (al:fte-ax-set e (caddr c) (car r)))
+                 (T (al:fte-entmod-1 e (car r)))))
+      (if ok
+        (list (cadr r) (if (member typ '("MTEXT" "MLEADER" "TABLE")) (al:mt-lines (car r)) (car r)))
+        (progn (setq al:*fail* (1+ al:*fail*)) nil)
+      )
+    )
+  )
+)
+
+(defun al:fte-do-replace (/ cs sp wild whole cps simple done res r n cnt regen owners)
+  (setq cs (al:fob "rcase") sp (al:fob "rspace") wild (al:fob "wild") whole (al:fob "rwhole"))
+  (setq cps (mapcar '(lambda (p)
+                       (list (al:pm-compile (if sp (al:remove-spaces (car p)) (car p)) wild whole cs)
+                             (cadr p) cs (car p)))
+                    al:*fte-pairs*))
+  (setq simple (and (not wild) (not whole) (not sp)
+                    (not (vl-some '(lambda (p) (cadr (car p))) cps))))
+  (setq al:*fail* 0 n 0 cnt 0)
+  (foreach c (al:fte-cands (if (al:fob "roff") (al:off-layers)))
+    (if (not (and (= (car c) "BLOCK") (member (cadr c) done)))
+      (if (setq r (al:fte-replace-cand c cps simple sp))
+        (progn
+          (setq n (1+ n) cnt (+ cnt (car r))
+                res (cons (list (car c) (cadr c) (caddr c) (cadr r)) res))
+          (if (= (car c) "BLOCK") (setq done (cons (cadr c) done) regen T))
+          (if (= (car c) "ATTRIB") (setq owners (cons (caddr c) owners)))
+        )
+      )
+    )
+  )
+  (foreach o owners (entupd o))
+  (if regen (command "_.REGEN"))
+  (al:layer-relock)
+  (setq al:*fte-status*
+         (strcat "바꾸기 완료: 객체 " (itoa n) "개, " (itoa cnt) "곳"
+                 (if (> al:*fail* 0) (strcat " / 바꾸지 못한 객체 " (itoa al:*fail*) "개") "")))
+  (reverse res)
+)
+
+;;; --- 찾은 문자 처리 (삭제 / 특성 변경) ------------------------------
+
+(defun al:set-dxf (ed code val)
+  (if (assoc code ed)
+    (subst (cons code val) (assoc code ed) ed)
+    (append ed (list (cons code val)))
+  )
+)
+
+(defun al:fte-change-props (c / e ed typ)
+  (setq e (cadr c) ed (entget e) typ (cdr (assoc 0 ed)))
+  (if (member typ '("TEXT" "MTEXT" "ATTRIB" "ATTDEF"))
+    (progn
+      (al:unlock-for e (caddr c))
+      (if (and (al:fob "ph") (> (atof (al:fo "phv")) 0.0)) (setq ed (al:set-dxf ed 40 (atof (al:fo "phv")))))
+      (if (and (al:fob "pw") (/= typ "MTEXT") (> (atof (al:fo "pwv")) 0.0)) (setq ed (al:set-dxf ed 41 (atof (al:fo "pwv")))))
+      (if (and (al:fob "ps") (tblsearch "STYLE" (al:fo "psv"))) (setq ed (al:set-dxf ed 7 (al:fo "psv"))))
+      (if (al:fob "pc") (setq ed (al:set-dxf ed 62 (max 0 (min 256 (atoi (al:fo "pcv")))))))
+      (if (and (al:fob "pl") (tblsearch "LAYER" (al:fo "plv"))) (setq ed (al:set-dxf ed 8 (al:fo "plv"))))
+      (if (entmod ed)
+        (progn (if (= (type (caddr c)) 'ENAME) (entupd (caddr c))) T)
+      )
+    )
+  )
+)
+
+;; 반환: 처리 후 남은 결과 목록
+(defun al:fte-process (res / p n keep regen)
+  (setq p (al:fo "proc") n 0)
+  (cond
+    ((= p "p1")
+     (foreach c res
+       (if (and (member (car c) '("TEXT" "MTEXT")) (progn (al:unlock-for (cadr c) nil) (entdel (cadr c))))
+         (setq n (1+ n))
+         (setq keep (cons c keep))
+       )
+     )
+     (al:layer-relock)
+     (setq al:*fte-status* (strcat (cond (al:*fte-status*) ("")) " / 찾은 문자 " (itoa n) "개 삭제"))
+     (reverse keep))
+    ((= p "p2")
+     (foreach c res
+       (if (al:fte-change-props c)
+         (progn (setq n (1+ n)) (if (= (car c) "BLOCK") (setq regen T)))
+       )
+     )
+     (if regen (command "_.REGEN"))
+     (al:layer-relock)
+     (setq al:*fte-status* (strcat (cond (al:*fte-status*) ("")) " / 특성 변경 " (itoa n) "개"))
+     res)
+    (T res)
+  )
+)
+
+;;; --- 위치, 확대, 선택 -----------------------------------------------
+
+(defun al:fte-target (c)
+  (if (member (car c) '("ATTRIB" "BLOCK")) (caddr c) (cadr c))
+)
+
+;; 블록 내부 문자의 WCS 위치 (1단계 변환)
+(defun al:fte-inner-pt (inner ins / ied ed bp p sx sy)
+  (setq ied (entget inner) ed (entget ins)
+        bp (cdr (assoc 10 (tblsearch "BLOCK" (cdr (assoc 2 ed)))))
+        p (cdr (assoc 10 ied))
+        sx (cond ((cdr (assoc 41 ed))) (1.0))
+        sy (cond ((cdr (assoc 42 ed))) (1.0)))
+  (al:v+ (cdr (assoc 10 ed))
+         (al:rot (list (* sx (- (car p) (car bp))) (* sy (- (cadr p) (cadr bp))))
+                 (cdr (assoc 50 ed))))
+)
+
+;; 결과의 영역: ((최소점) (최대점))
+(defun al:fte-extent (c / e bb p h ed sy)
+  (setq e (cadr c))
+  (cond
+    ((= (car c) "BLOCK")
+     (setq ed (entget (caddr c))
+           sy (abs (cond ((cdr (assoc 42 ed))) (1.0)))
+           h (* sy (cond ((cdr (assoc 40 (entget e)))) (1.0)))
+           p (al:fte-inner-pt e (caddr c)))
+     (list p (al:v+ p (list (* h 0.8 (max 1 (strlen (nth 3 c)))) h))))
+    ((setq bb (al:bbox e)) bb)
+    (T
+     (setq p (cdr (assoc 10 (entget e))) h (cond ((cdr (assoc 40 (entget e)))) (1.0)))
+     (list p (al:v+ p (list (* h 0.8 (max 1 (strlen (nth 3 c)))) h))))
+  )
+)
+
+(defun al:fte-height (c / ed)
+  (setq ed (entget (cadr c)))
+  (cond ((cdr (assoc 40 ed))) (1.0))
+)
+
+(defun al:grbox (p1 p2)
+  (grdraw p1 (list (car p2) (cadr p1)) 1 1)
+  (grdraw (list (car p2) (cadr p1)) p2 1 1)
+  (grdraw p2 (list (car p1) (cadr p2)) 1 1)
+  (grdraw (list (car p1) (cadr p2)) p1 1 1)
+)
+
+(defun al:fte-zoom (c / tgt lay ex h)
+  (setq tgt (al:fte-target c)
+        lay (cdr (assoc 410 (entget tgt))))
+  (if (and lay (/= (strcase lay) (strcase (getvar "CTAB"))))
+    (setvar "CTAB" lay)
+  )
+  (setq ex (al:fte-extent c)
+        h (max (al:fte-height c) (- (cadr (cadr ex)) (cadr (car ex)))))
+  (command "_.ZOOM" "_C" (al:p3 (al:mid (car ex) (cadr ex))) (* h (max 1.0 (atof (al:fo "zoom")))))
+  (if (al:fob "rect") (al:grbox (car ex) (cadr ex)))
+)
+
+(defun al:fte-in-ctab (c / lay)
+  (setq lay (cdr (assoc 410 (entget (al:fte-target c)))))
+  (or (null lay) (= (strcase lay) (strcase (getvar "CTAB"))))
+)
+
+(defun al:fte-select (lst / out)
+  (foreach c lst
+    (if (and (entget (al:fte-target c)) (al:fte-in-ctab c) (not (member (al:fte-target c) out)))
+      (setq out (cons (al:fte-target c) out))
+    )
+  )
+  (reverse out)
+)
+
+;;; --- 바꾸기 목록 (텍스트 파일, 엑셀, 저장 목록) ---------------------
+
+(defun al:fte-read-pairs (fname delim / f ln p out)
+  (if (setq f (open fname "r"))
+    (progn
+      (while (setq ln (read-line f))
+        (if (setq p (vl-string-search delim ln))
+          (setq out (cons (list (substr ln 1 p) (substr ln (+ p 1 (strlen delim)))) out))
+        )
+      )
+      (close f)
+    )
+  )
+  (reverse out)
+)
+
+(defun al:var->str (v)
+  (if (= (type v) 'VARIANT) (setq v (vlax-variant-value v)))
+  (cond
+    ((null v) "")
+    ((= (type v) 'STR) v)
+    ((numberp v) (al:num->str v))
+    (T "")
+  )
+)
+
+(defun al:fte-from-excel (/ xl rng v rows out)
+  (setq xl (al:catch 'vlax-get-object (list "Excel.Application")))
+  (if (null xl)
+    (progn (alert "실행 중인 엑셀이 없습니다.\n엑셀 파일을 먼저 여세요.") nil)
+    (progn
+      (princ "\n엑셀에서 [찾을 문자 | 바꿀 문자] 두 열을 선택한 뒤 CAD 로 돌아와 Enter: ")
+      (getstring)
+      (setq rng (al:catch 'vlax-get-property (list xl 'Selection))
+            v (if rng (al:catch 'vlax-get-property (list rng 'Value2))))
+      (if (and v (= (type (vlax-variant-value v)) 'SAFEARRAY))
+        (progn
+          (setq rows (vlax-safearray->list (vlax-variant-value v)))
+          (foreach r rows
+            (if (and (>= (length r) 2) (/= (al:var->str (car r)) ""))
+              (setq out (cons (list (al:var->str (car r)) (al:var->str (cadr r))) out))
+            )
+          )
+        )
+        (alert "엑셀에서 두 열 이상을 선택해야 합니다.")
+      )
+      (if rng (vlax-release-object rng))
+      (vlax-release-object xl)
+      (reverse out)
+    )
+  )
+)
+
+(defun al:fte-saved-names ()
+  (mapcar '(lambda (f) (substr f 4 (- (strlen f) 7)))
+          (vl-sort (vl-directory-files (al:data-dir) "FR_*.txt" 1) '<))
+)
+
+(defun al:fte-save-list (name / f)
+  (if (setq f (open (strcat (al:data-dir) "FR_" name ".txt") "w"))
+    (progn
+      (foreach p al:*fte-pairs* (write-line (strcat (car p) "\t" (cadr p)) f))
+      (close f)
+      T
+    )
+  )
+)
+
+;;; --- 대화상자 -------------------------------------------------------
+
+(defun al:dcl-file (/ fn f)
+  (if (and al:*dcl-path* (findfile al:*dcl-path*))
+    al:*dcl-path*
+    (progn
+      (setq fn (vl-filename-mktemp "al_fte.dcl"))
+      (if (setq f (open fn "w"))
+        (progn
+          (foreach l al:*dcl-fte* (write-line l f))
+          (close f)
+          (setq al:*dcl-path* fn)
+        )
+      )
+    )
+  )
+)
+
+(defun al:fill-list (key items)
+  (start_list key)
+  (mapcar 'add_list items)
+  (end_list)
+)
+
+(defun al:fte-short (s / n)
+  (setq s (car (al:str-replace s "\n" " " T nil)))
+  (if (> (strlen s) 60)
+    (strcat (substr s 1 (al:safe-cut s 60)) "...")
+    s
+  )
+)
+
+(defun al:fte-row (i c / lay)
+  (setq lay (if (entget (al:fte-target c)) (cdr (assoc 8 (entget (al:fte-target c)))) ""))
+  (strcat (itoa i) "\t" (cdr (assoc (car c) al:*fte-kind-names*)) "\t" lay "\t" (al:fte-short (nth 3 c)))
+)
+
+(defun al:fte-fill-results (/ i)
+  (setq i 0)
+  (al:fill-list "results" (mapcar '(lambda (c) (al:fte-row (setq i (1+ i)) c)) al:*fte-results*))
+  (if al:*fte-rsel* (set_tile "results" al:*fte-rsel*))
+  (set_tile "status" (cond (al:*fte-status*) ("")))
+)
+
+(defun al:fte-fill-pairs ()
+  (al:fill-list "rlist" (mapcar '(lambda (p) (strcat (car p) "\t→ " (cadr p))) al:*fte-pairs*))
+)
+
+(defun al:fte-fill-saved (/ names)
+  (setq al:*fte-saved* (al:fte-saved-names))
+  (al:fill-list "rsaved" al:*fte-saved*)
+)
+
+(defun al:fte-history () (vl-remove "" (al:str-split (al:cfg-get "FTE_hist" "") (chr 31))))
+
+(defun al:fte-history-add (s / h)
+  (setq h (cons s (vl-remove s (al:fte-history))))
+  (if (> (length h) 15) (setq h (reverse (cdr (reverse h)))))
+  (al:cfg-set "FTE_hist" (al:str-join h (chr 31)))
+)
+
+(defun al:fte-procinfo ()
+  (cond
+    ((= (al:fo "proc") "p1") "※ 찾은 문자 처리: 삭제 (검색 설정에서 변경)")
+    ((= (al:fo "proc") "p2") "※ 찾은 문자 처리: 특성 변경 (검색 설정에서 변경)")
+    (T "")
+  )
+)
+
+(defun al:sel-indices (str)
+  (if (and str (/= str "")) (mapcar 'atoi (al:str-split (al:str-trim str) " ")))
+)
+
+(defun al:remove-indices (lst idx / i out)
+  (setq i 0)
+  (foreach x lst
+    (if (not (member i idx)) (setq out (cons x out)))
+    (setq i (1+ i))
+  )
+  (reverse out)
+)
+
+;; 대화상자 값을 전역/설정에 보관
+(defun al:fte-keep-tiles ()
+  (al:fo-set "scope" (get_tile "scope"))
+  (foreach k al:*fte-main-toggles* (al:fo-set k (get_tile k)))
+  (al:fo-set "rdelim" (get_tile "rdelim"))
+  (setq al:*fte-ftext* (get_tile "ftext")
+        al:*fte-rfind* (get_tile "rfind")
+        al:*fte-rrepl* (get_tile "rrepl")
+        al:*fte-rsname* (get_tile "rsname")
+        al:*fte-rsel* (get_tile "results"))
+)
+
+(defun al:fte-close (code)
+  (al:fte-keep-tiles)
+  (setq al:*fte-pos* (done_dialog code))
+)
+
+(defun al:fte-init ()
+  (al:fill-list "scope" al:*fte-scopes*)
+  (set_tile "scope" (al:fo "scope"))
+  (mode_tile "selobj" (if (= (al:fo "scope") "4") 0 1))
+  (foreach k al:*fte-main-toggles* (set_tile k (al:fo k)))
+  (set_tile "rdelim" (al:fo "rdelim"))
+  (set_tile "ftext" (cond (al:*fte-ftext*) ("")))
+  (set_tile "rfind" (cond (al:*fte-rfind*) ("")))
+  (set_tile "rrepl" (cond (al:*fte-rrepl*) ("")))
+  (set_tile "rsname" (cond (al:*fte-rsname*) ("")))
+  (al:fill-list "fhist" (al:fte-history))
+  (al:fte-fill-pairs)
+  (al:fte-fill-saved)
+  (al:fte-fill-results)
+  (set_tile "procinfo" (al:fte-procinfo))
+  (mode_tile "ftext" 2)
+
+  (action_tile "scope" "(mode_tile \"selobj\" (if (= $value \"4\") 0 1))")
+  (action_tile "selobj" "(al:fte-close 10)")
+  (action_tile "fpick" "(al:fte-close 11)")
+  (action_tile "fpickm" "(al:fte-close 12)")
+  (action_tile "rpick" "(al:fte-close 13)")
+  (action_tile "dofind" "(al:fte-close 14)")
+  (action_tile "doreplace" "(al:fte-close 15)")
+  (action_tile "rtxt" "(al:fte-close 16)")
+  (action_tile "rxls" "(al:fte-close 17)")
+  (action_tile "rzoom" "(al:fte-close 20)")
+  (action_tile "results" "(if (= $reason 4) (al:fte-close 20))")
+  (action_tile "rsel" "(al:fte-close 21)")
+  (action_tile "rselall" "(al:fte-close 22)")
+  (action_tile "rline" "(al:fte-close 23)")
+  (action_tile "rerase" "(al:fte-close 24)")
+  (action_tile "rremove" "(al:fte-act-remove)")
+  (action_tile "fhist" "(al:fte-act-hist $value)")
+  (action_tile "fhclr" "(al:cfg-set \"FTE_hist\" \"\")(al:fill-list \"fhist\" nil)")
+  (action_tile "radd" "(al:fte-act-add)")
+  (action_tile "rdel" "(al:fte-act-pairdel)")
+  (action_tile "rclr" "(setq al:*fte-pairs* nil)(al:fte-fill-pairs)")
+  (action_tile "rload" "(al:fte-act-load)")
+  (action_tile "rsdel" "(al:fte-act-sdel)")
+  (action_tile "rsave" "(al:fte-act-save)")
+  (action_tile "settings" "(al:fte-settings)(set_tile \"procinfo\" (al:fte-procinfo))")
+  (action_tile "cancel" "(al:fte-close 0)")
+)
+
+(defun al:fte-act-hist (v / h)
+  (setq h (al:fte-history))
+  (if (and v (/= v "")) (set_tile "ftext" (nth (atoi v) h)))
+)
+
+(defun al:fte-act-remove ()
+  (setq al:*fte-results* (al:remove-indices al:*fte-results* (al:sel-indices (get_tile "results")))
+        al:*fte-rsel* nil
+        al:*fte-status* (strcat "목록 " (itoa (length al:*fte-results*)) "개"))
+  (al:fte-fill-results)
+)
+
+(defun al:fte-act-add (/ f r)
+  (setq f (get_tile "rfind") r (get_tile "rrepl"))
+  (if (= f "")
+    (set_tile "status" "찾을 문자를 입력하세요.")
+    (progn
+      (setq al:*fte-pairs* (append al:*fte-pairs* (list (list f r))))
+      (al:fte-fill-pairs)
+      (set_tile "rfind" "")
+      (set_tile "rrepl" "")
+      (mode_tile "rfind" 2)
+    )
+  )
+)
+
+(defun al:fte-act-pairdel ()
+  (setq al:*fte-pairs* (al:remove-indices al:*fte-pairs* (al:sel-indices (get_tile "rlist"))))
+  (al:fte-fill-pairs)
+)
+
+(defun al:fte-act-load (/ v)
+  (setq v (get_tile "rsaved"))
+  (if (and v (/= v "") al:*fte-saved*)
+    (progn
+      (setq al:*fte-pairs* (al:fte-read-pairs (strcat (al:data-dir) "FR_" (nth (atoi v) al:*fte-saved*) ".txt") "\t"))
+      (al:fte-fill-pairs)
+      (set_tile "status" (strcat "목록 불러옴: " (nth (atoi v) al:*fte-saved*)))
+    )
+  )
+)
+
+(defun al:fte-act-sdel (/ v)
+  (setq v (get_tile "rsaved"))
+  (if (and v (/= v "") al:*fte-saved*)
+    (progn
+      (vl-file-delete (strcat (al:data-dir) "FR_" (nth (atoi v) al:*fte-saved*) ".txt"))
+      (al:fte-fill-saved)
+    )
+  )
+)
+
+(defun al:fte-act-save (/ name)
+  (setq name (al:str-trim (get_tile "rsname")))
+  (cond
+    ((= name "") (set_tile "status" "저장 이름을 입력하세요."))
+    ((wcmatch name "*[\\/:`*`?\"<>|]*") (set_tile "status" "이름에 \\ / : * ? \" < > | 는 쓸 수 없습니다."))
+    ((null al:*fte-pairs*) (set_tile "status" "저장할 목록이 없습니다."))
+    ((and (>= (length (al:fte-saved-names)) 20) (not (member name (al:fte-saved-names))))
+     (set_tile "status" "저장 목록은 20개까지입니다. 먼저 하나를 삭제하세요."))
+    ((al:fte-save-list name)
+     (al:fte-fill-saved)
+     (set_tile "status" (strcat "목록 저장: " name)))
+    (T (set_tile "status" "저장하지 못했습니다."))
+  )
+)
+
+;; 검색 설정 (중첩 대화상자)
+(defun al:fte-settings (/ styles layers r i)
+  (if (new_dialog "al_fte_set" al:*fte-dclid*)
+    (progn
+      (foreach k al:*fte-set-toggles* (set_tile k (al:fo k)))
+      (foreach k '("zoom" "phv" "pwv" "pcv") (set_tile k (al:fo k)))
+      (set_tile "proc" (al:fo "proc"))
+      (setq r (tblnext "STYLE" T))
+      (while r
+        (if (/= (cdr (assoc 2 r)) "") (setq styles (cons (cdr (assoc 2 r)) styles)))
+        (setq r (tblnext "STYLE"))
+      )
+      (setq r (tblnext "LAYER" T))
+      (while r (setq layers (cons (cdr (assoc 2 r)) layers) r (tblnext "LAYER")))
+      (setq styles (vl-sort styles '<) layers (vl-sort layers '<))
+      (setq al:*fte-styles* styles al:*fte-layers* layers)
+      (al:fill-list "psv" styles)
+      (al:fill-list "plv" layers)
+      (if (setq i (vl-position (al:fo "psv") styles)) (set_tile "psv" (itoa i)))
+      (if (setq i (vl-position (al:fo "plv") layers)) (set_tile "plv" (itoa i)))
+      (action_tile "accept" "(if (al:fte-settings-save) (done_dialog 1))")
+      (start_dialog)
+    )
+  )
+)
+
+(defun al:fte-settings-save (/ z v)
+  (setq z (atof (get_tile "zoom")))
+  (if (<= z 0.0)
+    (progn (alert "Zoom 단계는 0보다 커야 합니다.") nil)
+    (progn
+      (foreach k al:*fte-set-toggles* (al:fo-set k (get_tile k)))
+      (foreach k '("zoom" "phv" "pwv" "pcv") (al:fo-set k (get_tile k)))
+      (al:fo-set "proc" (get_tile "proc"))
+      (if (and (setq v (get_tile "psv")) (/= v "")) (al:fo-set "psv" (nth (atoi v) al:*fte-styles*)))
+      (if (and (setq v (get_tile "plv")) (/= v "")) (al:fo-set "plv" (nth (atoi v) al:*fte-layers*)))
+      T
+    )
+  )
+)
+
+;;; --- 대화상자 밖에서 실행하는 동작 ----------------------------------
+
+(defun al:pick-text-string (/ s e ed typ)
+  (if (setq s (nentsel "\n문자 선택: "))
+    (progn
+      (setq e (car s) ed (entget e) typ (cdr (assoc 0 ed)))
+      (cond
+        ((= typ "MTEXT") (al:str-join (al:mt-paragraphs (al:mtext-string ed)) " "))
+        ((member typ '("TEXT" "ATTRIB" "ATTDEF")) (cdr (assoc 1 ed)))
+        (T (princ "\n문자가 아닙니다.") nil)
+      )
+    )
+  )
+)
+
+(defun al:fte-sel-results ()
+  (mapcar '(lambda (i) (nth i al:*fte-results*)) (al:sel-indices al:*fte-rsel*))
+)
+
+;; 반환: 다시 대화상자를 열면 T
+(defun al:fte-run (st / s ss l n pt)
+  (cond
+    ((= st 10)
+     (princ "\n검색할 객체 선택: ")
+     (if (setq ss (ssget)) (setq al:*fte-ss* ss al:*fte-status* (strcat "객체 " (itoa (sslength ss)) "개 선택됨")))
+     T)
+    ((= st 11)
+     (if (setq s (al:pick-text-string)) (setq al:*fte-ftext* s))
+     T)
+    ((= st 12)
+     (princ "\n찾을 문자들 선택: ")
+     (if (setq ss (ssget '((0 . "TEXT,MTEXT"))))
+       (progn
+         (foreach e (al:ss->list ss)
+           (setq s (al:ent-text (entget e)))
+           (if (= (cdr (assoc 0 (entget e))) "MTEXT") (setq s (al:mt-plain s)))
+           (if (and (/= s "") (not (member s l))) (setq l (cons s l)))
+         )
+         (setq al:*fte-ftext* (al:str-join (reverse l) ","))
+         (al:fo-set "fmulti" "1")
+       )
+     )
+     T)
+    ((= st 13)
+     (if (setq s (al:pick-text-string)) (setq al:*fte-rfind* s))
+     T)
+    ((= st 14)
+     (cond
+       ((= al:*fte-ftext* "") (setq al:*fte-status* "찾을 내용을 입력하세요."))
+       ((and (= (al:fo "scope") "4") (null al:*fte-ss*)) (setq al:*fte-status* "검색할 객체를 먼저 선택하세요."))
+       (T
+        (al:fte-history-add al:*fte-ftext*)
+        (setq al:*fte-results* (al:fte-do-find al:*fte-ftext*)
+              al:*fte-rsel* nil
+              al:*fte-status* (strcat "찾은 문자: " (itoa (length al:*fte-results*)) "개"))
+        (if (and al:*fte-results* (/= (al:fo "proc") "p0"))
+          (progn
+            (setq al:*fte-results* (al:fte-process al:*fte-results*))
+            (al:undo-end) (al:undo-begin)
+          )
+        ))
+     )
+     T)
+    ((= st 15)
+     (cond
+       ((null al:*fte-pairs*) (setq al:*fte-status* "바꾸기 목록이 비어 있습니다. [목록에 추가]를 누르세요."))
+       ((and (= (al:fo "scope") "4") (null al:*fte-ss*)) (setq al:*fte-status* "검색할 객체를 먼저 선택하세요."))
+       (T
+        (setq al:*fte-results* (al:fte-do-replace) al:*fte-rsel* nil)
+        (if (and al:*fte-results* (/= (al:fo "proc") "p0"))
+          (setq al:*fte-results* (al:fte-process al:*fte-results*))
+        )
+        (al:undo-end) (al:undo-begin))
+     )
+     T)
+    ((= st 16)
+     (if (setq s (getfiled "찾기/바꾸기 목록 텍스트 파일" (getvar "DWGPREFIX") "txt;csv" 0))
+       (progn
+         (setq l (al:fte-read-pairs s (if (= (al:fo "rdelim") "") "," (al:fo "rdelim"))))
+         (setq al:*fte-pairs* (append al:*fte-pairs* l)
+               al:*fte-status* (strcat "텍스트 파일에서 " (itoa (length l)) "개 추가"))
+       )
+     )
+     T)
+    ((= st 17)
+     (setq l (al:fte-from-excel))
+     (setq al:*fte-pairs* (append al:*fte-pairs* l)
+           al:*fte-status* (strcat "엑셀에서 " (itoa (length l)) "개 추가"))
+     T)
+    ((= st 20)
+     (setq l (al:fte-sel-results))
+     (cond
+       ((null l) (setq al:*fte-status* "확대할 항목을 선택하세요.") T)
+       ((not (entget (al:fte-target (car l)))) (setq al:*fte-status* "삭제된 객체입니다.") T)
+       (T
+        (al:fte-zoom (car l))
+        (princ "\n확인 후 Enter 를 누르면 대화상자로 돌아갑니다: ")
+        (getstring)
+        T)
+     ))
+    ((member st '(21 22))
+     (setq l (al:fte-select (if (= st 21) (al:fte-sel-results) al:*fte-results*)))
+     (if l
+       (progn
+         (setq al:*fte-pickfirst* (al:list->ss l))
+         (princ (strcat "\n" (itoa (length l)) "개 객체를 선택했습니다. (현재 공간의 객체만)"))
+         nil)
+       (progn (setq al:*fte-status* "현재 공간에서 선택할 객체가 없습니다.") T)
+     ))
+    ((= st 23)
+     (setq l (vl-remove-if-not 'al:fte-in-ctab (al:fte-sel-results)))
+     (if (null l)
+       (setq al:*fte-status* "현재 공간의 항목을 선택하세요.")
+       (if (setq pt (getpoint "\n연결선 기준점: "))
+         (progn
+           (foreach c l
+             (setq s (al:fte-extent c))
+             (al:make-line pt (al:mid (car s) (cadr s)))
+           )
+           (al:undo-end) (al:undo-begin)
+           (setq al:*fte-status* (strcat "연결선 " (itoa (length l)) "개 작성"))
+         )
+       )
+     )
+     T)
+    ((= st 24)
+     (setq l (al:fte-sel-results) n 0)
+     (foreach c l
+       (if (and (member (car c) '("TEXT" "MTEXT")) (entget (cadr c)))
+         (progn
+           (al:unlock-for (cadr c) nil)
+           (if (entdel (cadr c))
+             (setq n (1+ n) al:*fte-results* (vl-remove c al:*fte-results*))
+           )
+         )
+       )
+     )
+     (al:layer-relock)
+     (al:undo-end) (al:undo-begin)
+     (setq al:*fte-rsel* nil
+           al:*fte-status* (strcat (itoa n) "개 삭제 (TEXT, MTEXT 만 삭제됩니다)"))
+     T)
+    (T nil)
+  )
+)
+
+(defun al:fte-dialog (/ dcl again st)
+  (setq al:*fte-pickfirst* nil al:*fte-ss* nil al:*fte-status* nil)
+  (if (not (setq dcl (al:dcl-file)))
+    (princ "\n대화상자 파일을 만들 수 없습니다.")
+    (progn
+      (setq al:*fte-dclid* (load_dialog dcl) again T)
+      (while again
+        (if (not (new_dialog "al_fte" al:*fte-dclid* "" (cond (al:*fte-pos*) ('(-1 -1)))))
+          (progn (princ "\n대화상자를 열 수 없습니다.") (setq again nil))
+          (progn
+            (al:fte-init)
+            (setq st (start_dialog))
+            (setq again (al:fte-run st))
+          )
+        )
+      )
+      (unload_dialog al:*fte-dclid*)
+    )
+  )
+)
+
+(defun al:fte-command ()
+  (al:begin)
+  (al:fte-dialog)
+  (al:end)
+  (if al:*fte-pickfirst* (sssetfirst nil al:*fte-pickfirst*))
+  (princ)
+)
+
+(defun c:ALFTE () (al:fte-command))
+(defun c:ALFIND () (al:fte-command))
+(defun c:ALFR () (al:fte-command))
 
 ;;;; ---- AL_Purge.lsp ----
 ;;; ------------------------------------------------------------------
@@ -1476,8 +2771,9 @@
 (setq al:*commands*
   '(("ALPLOT"      "도곽(블록/사각형/창) 일괄 출력, PDF 장별 저장")
     ("ALPLOTL"     "레이아웃 일괄 출력")
-    ("ALFIND"      "문자 찾기 (하나씩 확대, 모두 선택)")
-    ("ALFR"        "문자 찾아 바꾸기 (문자/속성/치수/지시선/블록 내부)")
+    ("ALFTE"       "문자 찾기/바꾸기 대화상자 (ALFIND, ALFR 도 같음)")
+    ("-ALFIND"     "문자 찾기 (명령행 버전)")
+    ("-ALFR"       "문자 찾아 바꾸기 (명령행 버전)")
     ("ALPURGE"     "도면 정리 (소거 + 빈 문자, 길이 0 객체 삭제)")
     ("ALAUTOPURGE" "저장할 때 자동 소거 켜기/끄기")
     ("ALQTY"       "레이어/종류별 개수, 길이, 면적 집계")

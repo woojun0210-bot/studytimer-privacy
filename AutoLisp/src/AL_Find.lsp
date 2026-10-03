@@ -1,7 +1,8 @@
 ;;; ------------------------------------------------------------------
 ;;; AL_Find.lsp - 문자 찾기 / 바꾸기
-;;;   ALFIND : 문자 찾아 하나씩 확대해 보기, 찾은 객체 모두 선택
-;;;   ALFR   : 문자 찾아 바꾸기 (TEXT, MTEXT, 속성, 치수, 다중지시선, 블록 내부)
+;;;   -ALFIND : (명령행 버전) 문자 찾아 하나씩 확대해 보기, 찾은 객체 모두 선택
+;;;   -ALFR   : (명령행 버전) 문자 찾아 바꾸기
+;;;   대화상자 버전(ALFTE/ALFIND/ALFR)은 AL_FTE.lsp
 ;;; ------------------------------------------------------------------
 
 (setq al:*text-types* "TEXT,MTEXT,INSERT,DIMENSION,MULTILEADER,ATTDEF")
@@ -98,7 +99,7 @@
   n
 )
 
-(defun c:ALFR (/ old new cs scope inblk ss total nb)
+(defun c:-ALFR (/ old new cs scope inblk ss total nb)
   (al:begin)
   (setq old (getstring T "\n찾을 문자: "))
   (if (= old "")
@@ -144,7 +145,7 @@
   (if (> ht 0.0) (command "_.ZOOM" "_C" (al:p3 pt) ht))
 )
 
-(defun c:ALFIND (/ str cs ss found n i k e)
+(defun c:-ALFIND (/ str cs ss found n i k e)
   (al:begin)
   (setq str (getstring T "\n찾을 문자: "))
   (if (= str "")

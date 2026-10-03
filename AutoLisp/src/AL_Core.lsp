@@ -2,7 +2,7 @@
 ;;; AL_Core.lsp - CAD 공통 함수 (오류 처리, 설정, 선택, 출력 등)
 ;;; ------------------------------------------------------------------
 
-(setq al:*version* "1.0.0")
+(setq al:*version* "1.1.0")
 
 (if vl-load-com (vl-load-com))
 
@@ -54,12 +54,45 @@
 )
 
 (defun al:end ()
+  (if al:*relock* (al:catch 'al:layer-relock nil))
   (if al:*undo-open*
     (progn (al:catch 'al:undo-end nil) (setq al:*undo-open* nil))
   )
   (if al:*oldecho* (setvar "CMDECHO" al:*oldecho*))
   (setq *error* al:*olderr* al:*olderr* nil al:*oldecho* nil)
   (princ)
+)
+
+;;; --- 잠긴 레이어 잠시 풀기 / 다시 잠그기 -------------------------
+
+(defun al:layer-unlock (name / r ed fl)
+  (if (and name (setq r (tblobjname "LAYER" name)))
+    (progn
+      (setq ed (entget r) fl (cdr (assoc 70 ed)))
+      (if (and (= 4 (logand 4 fl))
+               (entmod (subst (cons 70 (- fl 4)) (assoc 70 ed) ed)))
+        (setq al:*relock* (cons name al:*relock*))
+      )
+    )
+  )
+)
+
+(defun al:layer-relock (/ r ed)
+  (foreach name al:*relock*
+    (if (setq r (tblobjname "LAYER" name))
+      (progn
+        (setq ed (entget r))
+        (entmod (subst (cons 70 (logior 4 (cdr (assoc 70 ed)))) (assoc 70 ed) ed))
+      )
+    )
+  )
+  (setq al:*relock* nil)
+)
+
+;; 엔티티(와 소유 블록)의 레이어 잠금을 잠시 푼다
+(defun al:unlock-for (e owner)
+  (if e (al:layer-unlock (cdr (assoc 8 (entget e)))))
+  (if (= (type owner) 'ENAME) (al:layer-unlock (cdr (assoc 8 (entget owner)))))
 )
 
 ;;; --- 설정 저장 (레지스트리/환경변수) ------------------------------

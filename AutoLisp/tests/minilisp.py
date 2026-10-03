@@ -56,6 +56,8 @@ class Reader:
                 self.skip()
                 if self.s[self.i] == ")":
                     self.i += 1
+                    if len(items) == 3 and items[1] == Sym("."):
+                        return (items[0], items[2])
                     return items
                 items.append(self.read())
         if c == ")":
@@ -140,7 +142,7 @@ class Interp:
         b[">="] = lambda *a: truth(all(a[i] >= a[i + 1] for i in range(len(a) - 1)))
         b["NOT"] = lambda a: truth(is_nil(a))
         b["NULL"] = b["NOT"]
-        b["EQ"] = lambda a, c: truth(a is c or (not isinstance(a, list) and a == c))
+        b["EQ"] = lambda a, c: truth(a is c or (not isinstance(a, list) and type(a) is type(c) and a == c))
         b["EQUAL"] = lambda a, c, *f: truth(a == c if not f else abs(a - c) <= f[0])
         b["NUMBERP"] = lambda a: truth(isinstance(a, (int, float)))
         b["STRCAT"] = lambda *a: "".join(a)
@@ -158,10 +160,11 @@ class Interp:
         b["CONS"] = lambda a, c: [a] + lst(c) if isinstance(c, list) or c is None else (a, c)
         b["LIST"] = lambda *a: list(a) if a else None
         b["CAR"] = lambda a: None if is_nil(a) else a[0]
-        b["CDR"] = lambda a: None if is_nil(a) or len(a) == 1 else a[1:]
+        b["CDR"] = lambda a: a[1] if isinstance(a, tuple) else (None if is_nil(a) or len(a) == 1 else a[1:])
         b["CADR"] = lambda a: b["CAR"](b["CDR"](a))
         b["CADDR"] = lambda a: b["CAR"](b["CDR"](b["CDR"](a)))
         b["CDDR"] = lambda a: b["CDR"](b["CDR"](a))
+        b["CADDDR"] = lambda a: b["CAR"](b["CDR"](b["CDR"](b["CDR"](a))))
         b["CAAR"] = lambda a: b["CAR"](b["CAR"](a))
         b["CADAR"] = lambda a: b["CADR"](b["CAR"](a))
         b["LAST"] = lambda a: lst(a)[-1] if not is_nil(a) else None
@@ -180,6 +183,26 @@ class Interp:
         b["MAPCAR"] = lambda f, *ls: [self.call(f, list(a)) for a in zip(*[lst(x) for x in ls])] or None
         b["APPLY"] = lambda f, a: self.call(f, lst(a))
         b["PRINC"] = lambda *a: a[0] if a else None
+        b["TYPE"] = self._type
+        b["FIX"] = lambda x: int(x)
+        b["VL-REMOVE"] = lambda x, l: [y for y in lst(l) if y != x] or None
+
+    def _type(self, x):
+        if x is None:
+            return None
+        if isinstance(x, Sym):
+            return Sym("SYM")
+        if isinstance(x, str):
+            return Sym("STR")
+        if isinstance(x, bool):
+            return Sym("SYM")
+        if isinstance(x, int):
+            return Sym("INT")
+        if isinstance(x, float):
+            return Sym("REAL")
+        if isinstance(x, list):
+            return Sym("LIST")
+        return Sym("SUBR")
 
     def _div(self, a, *r):
         for x in r:
