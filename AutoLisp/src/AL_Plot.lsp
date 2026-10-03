@@ -1,0 +1,272 @@
+;;; ------------------------------------------------------------------
+;;; AL_Plot.lsp - 출력(Plot)
+;;;   ALPLOT  : 도곽(블록/사각형/창 지정) 일괄 출력, PDF 장별 저장
+;;;   ALPLOTL : 레이아웃 일괄 출력
+;;; ------------------------------------------------------------------
+
+(defun al:vlist (v) (vlax-safearray->list (vlax-variant-value v)))
+
+(defun al:pt2d (p / sa)
+  (setq sa (vlax-make-safearray vlax-vbDouble '(0 . 1)))
+  (vlax-safearray-fill sa (list (car p) (cadr p)))
+  sa
+)
+
+(defun al:media-name (lay m / r)
+  (setq r (al:catch 'vla-GetLocaleMediaName (list lay m)))
+  (if r r m)
+)
+
+(defun al:pdf-device-p (dev) (wcmatch (strcase dev) "*PDF*"))
+
+(defun al:dir-slash (d)
+  (if (and (/= d "") (not (wcmatch d "*\\,*/"))) (strcat d "\\") d)
+)
+
+;; 출력 장치/용지/플롯 스타일 선택. 반환 (장치 용지 스타일) 또는 nil
+(defun al:plot-setup (lay / devs dev media names filt sel ctbs ctb)
+  (vla-RefreshPlotDeviceInfo lay)
+  (setq devs (vl-remove-if '(lambda (d) (= (strcase d) "NONE")) (al:vlist (vla-GetPlotDeviceNames lay))))
+  (setq dev (al:choose "출력 장치 목록:" devs (al:cfg-get "PlotDevice" (vla-get-ConfigName lay))))
+  (al:cfg-set "PlotDevice" dev)
+  (vla-put-ConfigName lay dev)
+  (vla-RefreshPlotDeviceInfo lay)
+  ;; 용지
+  (setq media (al:vlist (vla-GetCanonicalMediaNames lay)))
+  (setq filt (getstring T (strcat "\n용지 이름 필터 (예: A3, A1) <" (al:cfg-get "PlotPaperFilter" "A3") ">: ")))
+  (if (= filt "") (setq filt (al:cfg-get "PlotPaperFilter" "A3")))
+  (al:cfg-set "PlotPaperFilter" filt)
+  (setq sel (vl-remove-if-not
+              '(lambda (m) (wcmatch (strcase (al:media-name lay m)) (strcat "*" (strcase filt) "*")))
+              media))
+  (if (null sel) (progn (princ "\n필터에 맞는 용지가 없어 전체 목록을 표시합니다.") (setq sel media)))
+  (setq names (mapcar '(lambda (m) (al:media-name lay m)) sel))
+  (setq media (nth (vl-position
+                     (al:choose "용지 목록:" names (al:media-name lay (al:cfg-get "PlotMedia" "")))
+                     names)
+                   sel))
+  (al:cfg-set "PlotMedia" media)
+  ;; 플롯 스타일
+  (setq ctbs (al:vlist (vla-GetPlotStyleTableNames lay)))
+  (setq ctb (if ctbs (al:choose "플롯 스타일 목록:" ctbs (al:cfg-get "PlotStyle" "monochrome.ctb"))))
+  (if ctb (al:cfg-set "PlotStyle" ctb))
+  (list dev media ctb)
+)
+
+(defun al:plot-apply (lay setup)
+  (vla-put-ConfigName lay (car setup))
+  (vla-RefreshPlotDeviceInfo lay)
+  (vla-put-CanonicalMediaName lay (cadr setup))
+  (if (caddr setup)
+    (progn
+      (al:catch 'vla-put-StyleSheet (list lay (caddr setup)))
+      (al:catch 'vla-put-PlotWithPlotStyles (list lay :vlax-true))
+    )
+  )
+  (al:catch 'vla-put-PaperUnits (list lay 1))          ; 1 = mm
+  (al:catch 'vla-put-UseStandardScale (list lay :vlax-true))
+  (al:catch 'vla-put-StandardScale (list lay 0))       ; 0 = 용지에 맞춤
+  (al:catch 'vla-put-CenterPlot (list lay :vlax-true))
+)
+
+;; 창 크기와 용지 방향을 비교해 회전값 결정 (0 = 0도, 1 = 90도)
+(defun al:plot-rotation (lay ll ur orient / pw ph wide)
+  (cond
+    ((= orient "Normal") 0)
+    ((= orient "Rotate") 1)
+    (T
+     (setq wide (> (- (car ur) (car ll)) (- (cadr ur) (cadr ll))))
+     (if (vl-catch-all-error-p (vl-catch-all-apply 'vla-GetPaperSize (list lay 'pw 'ph)))
+       0
+       (if (eq wide (> pw ph)) 0 1)
+     ))
+  )
+)
+
+;; 한 영역 출력. fname 이 있으면 파일로 출력
+(defun al:plot-window (doc lay ll ur orient fname / plot r)
+  (vla-put-PlotRotation lay (al:plot-rotation lay ll ur orient))
+  (vla-SetWindowToPlot lay (al:pt2d ll) (al:pt2d ur))
+  (vla-put-PlotType lay 4)                             ; 4 = 창(Window)
+  (setq plot (vla-get-Plot doc))
+  (setq r (if fname
+            (vl-catch-all-apply 'vla-PlotToFile (list plot fname))
+            (vl-catch-all-apply 'vla-PlotToDevice (list plot))))
+  (not (or (vl-catch-all-error-p r) (= r :vlax-false)))
+)
+
+(defun al:collect-blocks (/ e name scope ss out)
+  (while (and (setq e (entsel "\n도곽 블록 하나 선택: "))
+              (/= (cdr (assoc 0 (entget (car e)))) "INSERT"))
+    (princ "\n블록이 아닙니다.")
+  )
+  (if e
+    (progn
+      (setq name (strcase (al:block-name (car e))))
+      (princ (strcat "\n도곽 블록 이름: " name))
+      (setq scope (al:kword "\n대상 - 현재 공간 전체(A)/직접 선택(S) [All/Select] <All>: " "All Select" "All"))
+      (setq ss (if (= scope "All")
+                 (ssget "X" (list '(0 . "INSERT") (cons 410 (getvar "CTAB"))))
+                 (ssget '((0 . "INSERT")))))
+      (foreach b (al:ss->list ss)
+        (if (= (strcase (al:block-name b)) name) (setq out (cons (al:bbox b) out)))
+      )
+    )
+  )
+  (vl-remove nil out)
+)
+
+(defun al:collect-rects (/ e lay scope ss out ed)
+  (while (and (setq e (entsel "\n도곽 사각형(폴리선) 하나 선택: "))
+              (/= (cdr (assoc 0 (entget (car e)))) "LWPOLYLINE"))
+    (princ "\n폴리선이 아닙니다.")
+  )
+  (if e
+    (progn
+      (setq lay (cdr (assoc 8 (entget (car e)))))
+      (princ (strcat "\n도곽 레이어: " lay))
+      (setq scope (al:kword "\n대상 - 현재 공간 전체(A)/직접 선택(S) [All/Select] <All>: " "All Select" "All"))
+      (setq ss (if (= scope "All")
+                 (ssget "X" (list '(0 . "LWPOLYLINE") (cons 8 lay) (cons 410 (getvar "CTAB"))))
+                 (ssget (list '(0 . "LWPOLYLINE") (cons 8 lay)))))
+      (foreach p (al:ss->list ss)
+        (setq ed (entget p))
+        (if (or (= 1 (logand 1 (cdr (assoc 70 ed)))) (member (cdr (assoc 90 ed)) '(4 5)))
+          (setq out (cons (al:bbox p) out))
+        )
+      )
+    )
+  )
+  (vl-remove nil out)
+)
+
+(defun al:collect-windows (/ p1 p2 out)
+  (while (setq p1 (getpoint "\n출력 영역 첫 번째 구석 (Enter=끝): "))
+    (if (setq p2 (getcorner p1 "\n반대쪽 구석: "))
+      (setq out (cons (list (list (min (car p1) (car p2)) (min (cadr p1) (cadr p2)))
+                            (list (max (car p1) (car p2)) (max (cadr p1) (cadr p2))))
+                      out))
+    )
+  )
+  (reverse out)
+)
+
+(defun c:ALPLOT (/ doc lay mode areas order tol items setup orient pdf folder bg i ok fname)
+  (if (not (al:activex-p))
+    (princ "\n출력 기능은 Windows 용 CAD(ActiveX 지원)에서만 사용할 수 있습니다.")
+    (progn
+      (al:begin)
+      (setq doc (al:doc) lay (vla-get-ActiveLayout doc))
+      (setq mode (al:kword "\n출력 영역 - 도곽 블록(B)/사각형 폴리선(R)/창 지정(W) [Block/Rect/Window] <Block>: "
+                           "Block Rect Window" "Block"))
+      (setq areas (cond ((= mode "Block") (al:collect-blocks))
+                        ((= mode "Rect") (al:collect-rects))
+                        (T (al:collect-windows))))
+      (if (null areas)
+        (princ "\n출력할 영역이 없습니다.")
+        (progn
+          (princ (strcat "\n출력 영역 " (itoa (length areas)) "개"))
+          (if (and (> (length areas) 1) (/= mode "Window"))
+            (progn
+              (setq order (al:kword "\n출력 순서 - 좌→우 먼저(Z)/위→아래 먼저(N) [Z/N] <Z>: " "Z N" (al:cfg-get "PlotOrder" "Z")))
+              (al:cfg-set "PlotOrder" order)
+              (setq tol (* 0.3 (apply 'min (mapcar '(lambda (a) (- (cadr (cadr a)) (cadr (car a)))) areas))))
+              (setq items (mapcar '(lambda (a) (cons (al:mid (car a) (cadr a)) a)) areas))
+              (setq areas (mapcar 'cdr (al:sort-order items tol order)))
+            )
+          )
+          (setq setup (al:plot-setup lay))
+          (setq orient (al:kword "\n용지 방향 - 자동(A)/그대로(N)/90도 회전(R) [Auto/Normal/Rotate] <Auto>: "
+                                 "Auto Normal Rotate" "Auto"))
+          (if (setq pdf (al:pdf-device-p (car setup)))
+            (progn
+              (setq folder (getstring T (strcat "\nPDF 저장 폴더 <" (getvar "DWGPREFIX") ">: ")))
+              (if (= folder "") (setq folder (getvar "DWGPREFIX")))
+              (setq folder (al:dir-slash folder))
+            )
+          )
+          (if (al:yes-p (strcat "\n" (itoa (length areas)) "장을 출력합니다. 계속할까요?") "Yes")
+            (progn
+              (setq bg (getvar "BACKGROUNDPLOT"))
+              (if bg (setvar "BACKGROUNDPLOT" 0))
+              (al:plot-apply lay setup)
+              (setq i 0 ok 0)
+              (foreach a areas
+                (setq i (1+ i))
+                (if pdf
+                  (setq fname (strcat folder (al:dwg-base) "_" (if (< i 10) "0" "") (itoa i) ".pdf"))
+                )
+                (princ (strcat "\n출력 중 " (itoa i) "/" (itoa (length areas)) (if fname (strcat " → " fname) "")))
+                (if (al:plot-window doc lay (car a) (cadr a) orient fname)
+                  (setq ok (1+ ok))
+                  (princ " ... 실패")
+                )
+              )
+              (if bg (setvar "BACKGROUNDPLOT" bg))
+              (princ (strcat "\n출력 완료: " (itoa ok) "/" (itoa (length areas)) "장"))
+            )
+          )
+        )
+      )
+      (al:end)
+    )
+  )
+  (princ)
+)
+
+(defun c:ALPLOTL (/ doc lays sel cur bg ok fname folder l i)
+  (if (not (al:activex-p))
+    (princ "\n출력 기능은 Windows 용 CAD(ActiveX 지원)에서만 사용할 수 있습니다.")
+    (progn
+      (al:begin)
+      (setq doc (al:doc) cur (vla-get-ActiveLayout doc))
+      (vlax-for l (vla-get-Layouts doc)
+        (if (/= (vla-get-ModelType l) :vlax-true) (setq lays (cons l lays)))
+      )
+      (setq lays (vl-sort lays '(lambda (a b) (< (vla-get-TabOrder a) (vla-get-TabOrder b)))))
+      (if (null lays)
+        (princ "\n레이아웃이 없습니다.")
+        (progn
+          (princ "\n레이아웃 목록 (각 레이아웃의 페이지 설정대로 출력):")
+          (setq i 0)
+          (foreach l lays
+            (setq i (1+ i))
+            (princ (strcat "\n  " (al:lpad (itoa i) 3) ". " (vla-get-Name l) "  [" (vla-get-ConfigName l) "]"))
+          )
+          (setq sel (getstring T "\n출력할 번호 (예: 1,3-5 / Enter=전체): "))
+          (setq sel (if (= sel "")
+                      lays
+                      (mapcar '(lambda (n) (nth (1- n) lays)) (al:parse-ranges sel (length lays)))))
+          (if (vl-some '(lambda (l) (al:pdf-device-p (vla-get-ConfigName l))) sel)
+            (progn
+              (setq folder (getstring T (strcat "\nPDF 저장 폴더 <" (getvar "DWGPREFIX") ">: ")))
+              (if (= folder "") (setq folder (getvar "DWGPREFIX")))
+              (setq folder (al:dir-slash folder))
+            )
+          )
+          (setq bg (getvar "BACKGROUNDPLOT"))
+          (if bg (setvar "BACKGROUNDPLOT" 0))
+          (setq ok 0)
+          (foreach l sel
+            (vla-put-ActiveLayout doc l)
+            (setq fname (if (al:pdf-device-p (vla-get-ConfigName l))
+                          (strcat folder (al:dwg-base) "_" (vla-get-Name l) ".pdf")))
+            (princ (strcat "\n출력 중: " (vla-get-Name l)))
+            (if (not (vl-catch-all-error-p
+                       (if fname
+                         (vl-catch-all-apply 'vla-PlotToFile (list (vla-get-Plot doc) fname))
+                         (vl-catch-all-apply 'vla-PlotToDevice (list (vla-get-Plot doc))))))
+              (setq ok (1+ ok))
+              (princ " ... 실패")
+            )
+          )
+          (vla-put-ActiveLayout doc cur)
+          (if bg (setvar "BACKGROUNDPLOT" bg))
+          (princ (strcat "\n출력 완료: " (itoa ok) "/" (itoa (length sel)) "개 레이아웃"))
+        )
+      )
+      (al:end)
+    )
+  )
+  (princ)
+)
